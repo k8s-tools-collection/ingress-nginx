@@ -241,6 +241,8 @@ type k8sStore struct {
 }
 
 // New creates a new object store to be used in the ingress controller
+//  实例化 nginx ingress controller 所需资源的 informer 和 lister, 
+// 并注册 eventHandler 方法
 func New(
 	namespace string,
 	namespaceSelector labels.Selector,
@@ -254,11 +256,11 @@ func New(
 	disableSyncEvents bool) Storer {
 
 	store := &k8sStore{
-		informers:             &Informer{},
-		listers:               &Lister{},
+		informers:             &Informer{}, // 各资源 informers 的集合
+		listers:               &Lister{}, // informers listers 集合
 		sslStore:              NewSSLCertTracker(),
-		updateCh:              updateCh,
-		backendConfig:         ngx_config.NewDefault(),
+		updateCh:              updateCh, // 通知给 syncqueue 的通道
+		backendConfig:         ngx_config.NewDefault(),  // 获取 nginx 模板中需要的默认变量, 比如缓冲大小呀, keepalive 配置, http2 相关配置等, 另外默认 WorkerProcesses 为当前的cpu核心数
 		syncSecretMu:          &sync.Mutex{},
 		backendConfigMu:       &sync.RWMutex{},
 		secretIngressMap:      NewObjectRefMap(),
@@ -325,6 +327,7 @@ func New(
 		informers.WithTweakListOptions(secretsTweakListOptionsFunc),
 	)
 
+	// 实例化 nginx ingress controller 所需资源的 informer 和 lister.
 	store.informers.Ingress = infFactory.Networking().V1().Ingresses().Informer()
 	store.listers.Ingress.Store = store.informers.Ingress.GetStore()
 
@@ -420,6 +423,7 @@ func New(
 		AddFunc: func(obj interface{}) {
 			ing, _ := toIngress(obj)
 
+			// 过滤不合法的 ns
 			if !watchedNamespace(ing.Namespace) {
 				return
 			}
@@ -445,10 +449,13 @@ func New(
 
 			recorder.Eventf(ing, corev1.EventTypeNormal, "Sync", "Scheduled for sync")
 
+			// 更新 store 里 ingress 的缓存
 			store.syncIngress(ing)
+			// 更新 store 里 secret 的缓存
 			store.updateSecretIngressMap(ing)
 			store.syncSecrets(ing)
 
+			// 向 updateCh 传递事件, 让 syncqueue 同步并加载配置
 			updateCh.In() <- Event{
 				Type: CreateEvent,
 				Obj:  obj,
@@ -501,6 +508,7 @@ func New(
 				}
 			}
 
+			// 同步 store 缓存, 并传递更新事件
 			store.syncIngress(curIng)
 			store.updateSecretIngressMap(curIng)
 			store.syncSecrets(curIng)
@@ -760,9 +768,11 @@ func New(
 		},
 	}
 
+	// service informer eventHandler 的实现原理,service type 为 externalName 
 	serviceHandler := cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
 			svc := obj.(*corev1.Service)
+			// 只关注 service type 为 externalName 的
 			if svc.Spec.Type == corev1.ServiceTypeExternalName {
 				updateCh.In() <- Event{
 					Type: CreateEvent,
@@ -772,6 +782,7 @@ func New(
 		},
 		DeleteFunc: func(obj interface{}) {
 			svc := obj.(*corev1.Service)
+			// 只关注 service type 为 externalName 的
 			if svc.Spec.Type == corev1.ServiceTypeExternalName {
 				updateCh.In() <- Event{
 					Type: DeleteEvent,
@@ -782,7 +793,7 @@ func New(
 		UpdateFunc: func(old, cur interface{}) {
 			oldSvc := old.(*corev1.Service)
 			curSvc := cur.(*corev1.Service)
-
+			// 一样则忽略
 			if reflect.DeepEqual(oldSvc, curSvc) {
 				return
 			}
@@ -794,13 +805,18 @@ func New(
 		},
 	}
 
+	// 监听 ingress 资源并注册方法
 	store.informers.Ingress.AddEventHandler(ingEventHandler)
 	if !icConfig.IgnoreIngressClass {
 		store.informers.IngressClass.AddEventHandler(ingressClassEventHandler)
 	}
+	// 监听 endpoints 资源并注册方法
 	store.informers.EndpointSlice.AddEventHandler(epsEventHandler)
+	// 监听 secret 资源并注册方法
 	store.informers.Secret.AddEventHandler(secrEventHandler)
+	// 监听 configmap 资源并注册方法
 	store.informers.ConfigMap.AddEventHandler(cmEventHandler)
+	// 监听 service 资源并注册方法
 	store.informers.Service.AddEventHandler(serviceHandler)
 
 	// do not wait for informers to read the configmap configuration

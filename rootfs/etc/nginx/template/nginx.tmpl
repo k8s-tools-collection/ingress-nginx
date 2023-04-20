@@ -744,8 +744,10 @@ http {
 }
 
 stream {
+    # 定义 lua 包位置
     lua_package_path "/etc/nginx/lua/?.lua;/etc/nginx/lua/vendor/?.lua;;";
 
+    # 设置一个共享存储
     lua_shared_dict tcp_udp_configuration_data 5M;
     
     {{ buildResolvers $cfg.Resolver $cfg.DisableIpv6DNS }}
@@ -788,13 +790,14 @@ stream {
 
     log_format log_stream '{{ $cfg.LogFormatStream }}';
 
+    # 判断 access_log 是否开启 access_log, 如果开启则指定文件路径及格式.
     {{ if or $cfg.DisableAccessLog $cfg.DisableStreamAccessLog }}
     access_log off;
     {{ else }}
     access_log {{ or $cfg.StreamAccessLogPath $cfg.AccessLogPath }} log_stream {{ $cfg.AccessLogParams }};
     {{ end }}
 
-
+    # 错误日志
     error_log  {{ $cfg.ErrorLogPath }} {{ $cfg.ErrorLogLevel }};
     {{ if $cfg.EnableRealIp }}
     {{ range $trusted_ip := $cfg.ProxyRealIPCIDR }}
@@ -803,8 +806,11 @@ stream {
     {{ end }}
 
     upstream upstream_balancer {
+    	# 这个只是占位符而已
         server 0.0.0.1:1234; # placeholder
 
+        # tcp 和 udp 转发是依赖 openretry balancer_by_lua_block 控制的.
+        # 具体转发逻辑在 tcp_udp_balancer.lua 这里实现的, balance 是调度入口.
         balancer_by_lua_block {
           tcp_udp_balancer.balance()
         }
@@ -821,17 +827,20 @@ stream {
     }
 
     # TCP services
+    # 遍历生成 TCP services
     {{ range $tcpServer := .TCPBackends }}
     server {
         preread_by_lua_block {
             ngx.var.proxy_upstream_name="tcp-{{ $tcpServer.Backend.Namespace }}-{{ $tcpServer.Backend.Name }}-{{ $tcpServer.Backend.Port }}";
         }
 
+	    # 针对 tcp ipv4 listen 进行渲染
         {{ range $address := $all.Cfg.BindAddressIpv4 }}
         listen                  {{ $address }}:{{ $tcpServer.Port }}{{ if $tcpServer.Backend.ProxyProtocol.Decode }} proxy_protocol{{ end }};
         {{ else }}
         listen                  {{ $tcpServer.Port }}{{ if $tcpServer.Backend.ProxyProtocol.Decode }} proxy_protocol{{ end }};
         {{ end }}
+        # 针对 tcp ipv6 listen 进行渲染
         {{ if $IsIPV6Enabled }}
         {{ range $address := $all.Cfg.BindAddressIpv6 }}
         listen                  {{ $address }}:{{ $tcpServer.Port }}{{ if $tcpServer.Backend.ProxyProtocol.Decode }} proxy_protocol{{ end }};
@@ -839,12 +848,15 @@ stream {
         listen                  [::]:{{ $tcpServer.Port }}{{ if $tcpServer.Backend.ProxyProtocol.Decode }} proxy_protocol{{ end }};
         {{ end }}
         {{ end }}
+        # 配置 tcp proxy 参数
         proxy_timeout           {{ $cfg.ProxyStreamTimeout }};
         proxy_next_upstream     {{ if $cfg.ProxyStreamNextUpstream }}on{{ else }}off{{ end }};
         proxy_next_upstream_timeout {{ $cfg.ProxyStreamNextUpstreamTimeout }};
         proxy_next_upstream_tries   {{ $cfg.ProxyStreamNextUpstreamTries }};
 
+	    # 转发到 upstream_balancer
         proxy_pass              upstream_balancer;
+        # proxy_protocol 是在转发的 tcp 报文中插入客户端 ip 地址, 这样经过层层网关转发后, 后面的 nginx 也可以拿到客户端地址.
         {{ if $tcpServer.Backend.ProxyProtocol.Encode }}
         proxy_protocol          on;
         {{ end }}
@@ -852,6 +864,7 @@ stream {
     {{ end }}
 
     # UDP services
+    # 遍历生成 UDP services
     {{ range $udpServer := .UDPBackends }}
     server {
         preread_by_lua_block {

@@ -57,6 +57,7 @@ type Element struct {
 }
 
 // Run starts processing elements in the queue
+// 一直调用 worker 协程, 直到 stopCh 退出, 失败重新调度间隔为 1秒.
 func (t *Queue) Run(period time.Duration, stopCh <-chan struct{}) {
 	wait.Until(t.worker, period, stopCh)
 }
@@ -118,6 +119,7 @@ func (t *Queue) worker() {
 		ts := time.Now().UnixNano()
 
 		item := key.(Element)
+		// 如果上次同步时间超过了 item 时间大, 则跳过, 避免无效同步.
 		if item.Timestamp != 0 && t.lastSync > item.Timestamp {
 			klog.V(3).InfoS("skipping sync", "key", item.Key, "last", t.lastSync, "now", item.Timestamp)
 			t.queue.Forget(key)
@@ -126,17 +128,20 @@ func (t *Queue) worker() {
 		}
 
 		klog.V(3).InfoS("syncing", "key", item.Key)
+		// 使用 syncIngress 来处理 key, 该方法为 ingress-nginx 核心处理入口.
 		if err := t.sync(key); err != nil {
 			klog.ErrorS(err, "requeuing", "key", item.Key)
+			// 同步 nginx 失败, 则重新入队
 			t.queue.AddRateLimited(Element{
 				Key:       item.Key,
 				Timestamp: 0,
 			})
 		} else {
+			// 成功可剔除
 			t.queue.Forget(key)
 			t.lastSync = ts
 		}
-
+		// 成功处理
 		t.queue.Done(key)
 	}
 }

@@ -166,6 +166,7 @@ func (n NGINXController) GetPublishService() *apiv1.Service {
 // syncIngress collects all the pieces required to assemble the NGINX
 // configuration file and passes the resulting data structures to the backend
 // (OnUpdate) when a reload is deemed necessary.
+// ingress 的核心同步方法
 func (n *NGINXController) syncIngress(interface{}) error {
 	n.syncRateLimiter.Accept()
 
@@ -173,12 +174,15 @@ func (n *NGINXController) syncIngress(interface{}) error {
 		return nil
 	}
 
+	// 从 store 的 informer 里获取 ingress 集合
 	ings := n.store.ListIngresses()
+	// 拿到 hosts 集合, servers 集合
 	hosts, servers, pcfg := n.getConfiguration(ings)
 
 	n.metricCollector.SetSSLExpireTime(servers)
 	n.metricCollector.SetSSLInfo(servers)
 
+	// 如果配置无变更, 直接跳出
 	if n.runningConfig.Equal(pcfg) {
 		klog.V(3).Infof("No configuration change detected, skipping backend reload")
 		return nil
@@ -186,15 +190,18 @@ func (n *NGINXController) syncIngress(interface{}) error {
 
 	n.metricCollector.SetHosts(hosts)
 
+	// 不满足动态更新, 需要构建配置并 reload 加载.
 	if !utilingress.IsDynamicConfigurationEnough(pcfg, n.runningConfig) {
 		klog.InfoS("Configuration changes detected, backend reload required")
 
+		// 计算 pcfg 的 hash 值
 		hash, _ := hashstructure.Hash(pcfg, hashstructure.FormatV1, &hashstructure.HashOptions{
 			TagName: "json",
 		})
 
 		pcfg.ConfigurationChecksum = fmt.Sprintf("%v", hash)
 
+		// 真正操作 nginx, 生成 nginx 配置, 语法检测, 最后执行 reload 热加载.
 		err := n.OnUpdate(*pcfg)
 		if err != nil {
 			n.metricCollector.IncReloadErrorCount()
@@ -211,11 +218,13 @@ func (n *NGINXController) syncIngress(interface{}) error {
 		n.recorder.Eventf(k8s.IngressPodDetails, apiv1.EventTypeNormal, "RELOAD", "NGINX reload triggered due to a change in configuration")
 	}
 
+	// 如果是首次配置, 需稍等一下
 	isFirstSync := n.runningConfig.Equal(&ingress.Configuration{})
 	if isFirstSync {
 		// For the initial sync it always takes some time for NGINX to start listening
 		// For large configurations it might take a while so we loop and back off
 		klog.InfoS("Initial sync, sleeping for 1 second")
+		// 首次配置, 等待个 1s, nginx 解析大配置文件时, 有可能会有延迟.
 		time.Sleep(1 * time.Second)
 	}
 
@@ -228,17 +237,20 @@ func (n *NGINXController) syncIngress(interface{}) error {
 
 	retriesRemaining := retry.Steps
 	err := wait.ExponentialBackoff(retry, func() (bool, error) {
+		// 执行动态配置, 后面有详细讲解
 		err := n.configureDynamically(pcfg)
 		if err == nil {
 			klog.V(2).Infof("Dynamic reconfiguration succeeded.")
 			return true, nil
 		}
+		// 重试减一
 		retriesRemaining--
 		if retriesRemaining > 0 {
 			klog.Warningf("Dynamic reconfiguration failed (retrying; %d retries left): %v", retriesRemaining, err)
 			return false, nil
 		}
 		klog.Warningf("Dynamic reconfiguration failed: %v", err)
+		// 当 err 不为 nil 时, wait 不会再进行重试调度.
 		return false, err
 	})
 	if err != nil {

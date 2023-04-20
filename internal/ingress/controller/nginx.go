@@ -78,6 +78,7 @@ func NewNGINXController(config *Configuration, mc metric.Collector) *NGINXContro
 		Interface: config.Client.CoreV1().Events(config.Namespace),
 	})
 
+	// 读取 resulv.conf 文件，获取 dns server 地址集合
 	h, err := dns.GetSystemNameServers()
 	if err != nil {
 		klog.Warningf("Error reading system nameservers: %v", err)
@@ -94,7 +95,8 @@ func NewNGINXController(config *Configuration, mc metric.Collector) *NGINXContro
 			Component: "nginx-ingress-controller",
 		}),
 
-		stopCh:   make(chan struct{}),
+		stopCh: make(chan struct{}),
+		// informer 注册 eventHandler 会往这个 chan 发送事件.
 		updateCh: channels.NewRingChannel(1024),
 
 		ngxErrCh: make(chan error),
@@ -124,6 +126,7 @@ func NewNGINXController(config *Configuration, mc metric.Collector) *NGINXContro
 		}
 	}
 
+	// 实例化 store 对象, 可以把 store 想成一个有各种数据的缓存的存储, 内部也有 informer.
 	n.store = store.New(
 		config.Namespace,
 		config.WatchNamespaceSelector,
@@ -133,12 +136,12 @@ func NewNGINXController(config *Configuration, mc metric.Collector) *NGINXContro
 		config.DefaultSSLCertificate,
 		config.ResyncPeriod,
 		config.Client,
-		n.updateCh,
+		n.updateCh, // 把实例化的 updateCh 传进去
 		config.DisableCatchAll,
 		config.DeepInspector,
 		config.IngressClassConfiguration,
 		config.DisableSyncEvents)
-
+	// 实例化 queue, 并且在 queue里注册了回调方法, syncIngress 是 nginx ingress controller 最核心的同步方法.
 	n.syncQueue = task.NewTaskQueue(n.syncIngress)
 
 	if config.UpdateStatus {
@@ -154,7 +157,9 @@ func NewNGINXController(config *Configuration, mc metric.Collector) *NGINXContro
 		klog.Warning("Update of Ingress status is disabled (flag --update-status)")
 	}
 
+	// 用在 inotify 文件监听的回调方法
 	onTemplateChange := func() {
+		// 从 `/etc/nginx/template/nginx.tmpl` 读取预设的模板, 然后进行解析生成 template 对象.
 		template, err := ngx_template.NewTemplate(nginx.TemplatePath)
 		if err != nil {
 			// this error is different from the rest because it must be clear why nginx is not working
@@ -164,9 +169,11 @@ func NewNGINXController(config *Configuration, mc metric.Collector) *NGINXContro
 
 		n.t = template
 		klog.InfoS("New NGINX configuration template loaded")
+		// 向 queue 传递事件, 平滑热加载 nginx 配置
 		n.syncQueue.EnqueueTask(task.GetDummyObject("template-change"))
 	}
 
+	// 从 `/etc/nginx/template/nginx.tmpl` 读取预设的模板, 然后进行解析生成 template 对象.
 	ngxTpl, err := ngx_template.NewTemplate(nginx.TemplatePath)
 	if err != nil {
 		klog.Fatalf("Invalid NGINX configuration template: %v", err)
@@ -174,11 +181,13 @@ func NewNGINXController(config *Configuration, mc metric.Collector) *NGINXContro
 
 	n.t = ngxTpl
 
+	// 使用 inotify 机制异步监听 nginx.tmpl 模板文件, 当模板文件发生变更时, 则回调 onTemplateChange 方法, 重新读取模板并构建模板对象, 然后同步配置
 	_, err = file.NewFileWatcher(nginx.TemplatePath, onTemplateChange)
 	if err != nil {
 		klog.Fatalf("Error creating file watcher for %v: %v", nginx.TemplatePath, err)
 	}
 
+	// 获取 geoip 目录下的相关文件, v4.4.2 里当前就只有三个文件, 分别是 geoip.dat, geoIPASNum.dat, geoLiteCity.dat 数据文件.
 	filesToWatch := []string{}
 	err = filepath.Walk("/etc/nginx/geoip/", func(path string, info os.FileInfo, err error) error {
 		if err != nil {
@@ -198,6 +207,7 @@ func NewNGINXController(config *Configuration, mc metric.Collector) *NGINXContro
 	}
 
 	for _, f := range filesToWatch {
+		// 异步监听 geoip dat 数据文件, 当发生增删改时, 重新平滑热加载 nginx 配置.
 		_, err = file.NewFileWatcher(f, func() {
 			klog.InfoS("File changed detected. Reloading NGINX", "path", f)
 			n.syncQueue.EnqueueTask(task.GetDummyObject("file-change"))
@@ -257,9 +267,11 @@ type NGINXController struct {
 }
 
 // Start starts a new NGINX master process running in the foreground.
+//
+//	服务启动的入口
 func (n *NGINXController) Start() {
 	klog.InfoS("Starting NGINX Ingress controller")
-
+	// 内部启动 informer 监听并维护各资源的本地缓存
 	n.store.Run(n.stopCh)
 
 	// we need to use the defined ingress class to allow multiple leaders
@@ -269,11 +281,13 @@ func (n *NGINXController) Start() {
 	// Should revisit this in a future
 	electionID := n.cfg.ElectionID
 
+	// 进行选举, 只有主实例才可以执行状态同步的更新的逻辑
 	setupLeaderElection(&leaderElectionConfig{
 		Client:     n.cfg.Client,
 		ElectionID: electionID,
 		OnStartedLeading: func(stopCh chan struct{}) {
 			if n.syncStatus != nil {
+				// 开启状态的同步更新
 				go n.syncStatus.Run(stopCh)
 			}
 
@@ -288,6 +302,8 @@ func (n *NGINXController) Start() {
 		},
 	})
 
+	// 配置进程组, 使用 cmd 创建的程序都所属相同的 pgid 组id,
+	// 这样杀掉进程时可以按照进程组杀, 避免有遗漏的进程.
 	cmd := n.command.ExecCommand()
 
 	// put NGINX in another process group to prevent it
@@ -297,15 +313,21 @@ func (n *NGINXController) Start() {
 		Pgid:    0,
 	}
 
+	// 加载 ssl proxy
 	if n.cfg.EnableSSLPassthrough {
 		n.setupSSLProxy()
 	}
 
 	klog.InfoS("Starting NGINX process")
+	// 启动 nginx 进程, 指定配置为 `/etc/nginx/nginx.conf`.
 	n.start(cmd)
 
+	// 启动 syncQueue 里 run 方法, 该方法内部会从队列中读取任务,
+	// 并调用 syncIngress 来同步 nginx 配置.
 	go n.syncQueue.Run(time.Second, n.stopCh)
 	// force initial sync
+	// 前面 nginx 启动使用时, 只是使用了默认的 nginx.conf, 里面几乎没什么东西,
+	// 这里通过主动传任务到 syncqueue, 然后 syncqueue 利用 syncIngress 来同步配置并完成热加载
 	n.syncQueue.EnqueueTask(task.GetDummyObject("initial-sync"))
 
 	// In case of error the temporal configuration file will
@@ -313,6 +335,8 @@ func (n *NGINXController) Start() {
 	go func() {
 		for {
 			time.Sleep(5 * time.Minute)
+			// 启动一个异步 gc 协程, 清理 nginx 临时文件, 临时文件的名字前缀有 `nginx-cfg` 字符串,
+			// 当满足临时文件特征, 且更改超过5分钟则删除该临时文件
 			err := cleanTempNginxCfg()
 			if err != nil {
 				klog.ErrorS(err, "Unexpected error removing temporal configuration files")
@@ -345,7 +369,7 @@ func (n *NGINXController) Start() {
 			if n.isShuttingDown {
 				break
 			}
-
+			// 从 informer 拿到更改事件
 			if evt, ok := event.(store.Event); ok {
 				klog.V(3).InfoS("Event received", "type", evt.Type, "object", evt.Obj)
 				if evt.Type == store.ConfigurationEvent {
@@ -353,7 +377,7 @@ func (n *NGINXController) Start() {
 					n.syncQueue.EnqueueTask(task.GetDummyObject("configmap-change"))
 					continue
 				}
-
+				// 同上, 只是任务可跳过.
 				n.syncQueue.EnqueueSkippableTask(evt.Obj)
 			} else {
 				klog.Warningf("Unexpected event type received %T", event)
@@ -439,8 +463,10 @@ func (n NGINXController) DefaultEndpoint() ingress.Endpoint {
 }
 
 // generateTemplate returns the nginx configuration file content
+// 通过模板生成 nginx 配置
 func (n NGINXController) generateTemplate(cfg ngx_config.Configuration, ingressCfg ingress.Configuration) ([]byte, error) {
 
+	// 处理 ssl 配置
 	if n.cfg.EnableSSLPassthrough {
 		servers := []*tcpproxy.TCPServer{}
 		for _, pb := range ingressCfg.PassthroughBackends {
@@ -505,18 +531,21 @@ func (n NGINXController) generateTemplate(cfg ngx_config.Configuration, ingressC
 		serverNameBytes += hostnameLength
 	}
 
+	// 设置 nginx 的 server_names_hash_bucket_size, 通过预设 hash bucket 的个数, 来加快查询速度, 减少拉链查询的概率.
 	nameHashBucketSize := nginxHashBucketSize(longestName)
 	if cfg.ServerNameHashBucketSize < nameHashBucketSize {
 		klog.V(3).InfoS("Adjusting ServerNameHashBucketSize variable", "value", nameHashBucketSize)
 		cfg.ServerNameHashBucketSize = nameHashBucketSize
 	}
 
+	// 设置 nginx 的 map_hash_bucket_size, 搭配上面的配置使用, 提高 nginx hashmap 检索速度.
 	serverNameHashMaxSize := nextPowerOf2(serverNameBytes)
 	if cfg.ServerNameHashMaxSize < serverNameHashMaxSize {
 		klog.V(3).InfoS("Adjusting ServerNameHashMaxSize variable", "value", serverNameHashMaxSize)
 		cfg.ServerNameHashMaxSize = serverNameHashMaxSize
 	}
 
+	// 设置 nginx 的 worker_rlimit_nofile 每个 worker 可以打开的最大文件描述符数量, 这里的 fd 不仅仅指文件, 还是链接文件描述符 (socket fd).
 	if cfg.MaxWorkerOpenFiles == 0 {
 		// the limit of open files is per worker process
 		// and we leave some room to avoid consuming all the FDs available
@@ -524,18 +553,21 @@ func (n NGINXController) generateTemplate(cfg ngx_config.Configuration, ingressC
 		klog.V(3).InfoS("Maximum number of open file descriptors", "value", maxOpenFiles)
 		if maxOpenFiles < 1024 {
 			// this means the value of RLIMIT_NOFILE is too low.
+			// 最小为 1024
 			maxOpenFiles = 1024
 		}
 		klog.V(3).InfoS("Adjusting MaxWorkerOpenFiles variable", "value", maxOpenFiles)
 		cfg.MaxWorkerOpenFiles = maxOpenFiles
 	}
 
+	// 配置 nginx worker_connections, 每个 worker 的连接数量, worker_connections 通常要小于 worker_rlimit_nofile, 一个是连接的限制, 一个是所有 fd 的限制.
 	if cfg.MaxWorkerConnections == 0 {
 		maxWorkerConnections := int(float64(cfg.MaxWorkerOpenFiles * 3.0 / 4))
 		klog.V(3).InfoS("Adjusting MaxWorkerConnections variable", "value", maxWorkerConnections)
 		cfg.MaxWorkerConnections = maxWorkerConnections
 	}
 
+	// 配置转发请求时的 proxy header, 这个从 configmap 里获取.
 	setHeaders := map[string]string{}
 	if cfg.ProxySetHeaders != "" {
 		cmap, err := n.store.GetConfigMap(cfg.ProxySetHeaders)
@@ -546,6 +578,7 @@ func (n NGINXController) generateTemplate(cfg ngx_config.Configuration, ingressC
 		}
 	}
 
+	// 响应时填充的 header, 同样从 configmap 获取.
 	addHeaders := map[string]string{}
 	if cfg.AddHeaders != "" {
 		cmap, err := n.store.GetConfigMap(cfg.AddHeaders)
@@ -577,10 +610,12 @@ func (n NGINXController) generateTemplate(cfg ngx_config.Configuration, ingressC
 		}
 	}
 
+	// 设置 ssl 参数
 	cfg.SSLDHParam = sslDHParam
 
 	cfg.DefaultSSLCertificate = n.getDefaultSSLCertificate()
 
+	// 配置 access_log 和 error_log 的位置
 	if n.cfg.IsChroot {
 		if cfg.AccessLogPath == "/var/log/nginx/access.log" {
 			cfg.AccessLogPath = fmt.Sprintf("syslog:server=%s", n.cfg.InternalLoggerAddress)
@@ -591,43 +626,61 @@ func (n NGINXController) generateTemplate(cfg ngx_config.Configuration, ingressC
 	}
 
 	tc := ngx_config.TemplateConfig{
-		ProxySetHeaders:          setHeaders,
-		AddHeaders:               addHeaders,
-		BacklogSize:              sysctlSomaxconn(),
-		Backends:                 ingressCfg.Backends,
-		PassthroughBackends:      ingressCfg.PassthroughBackends,
-		Servers:                  ingressCfg.Servers,
-		TCPBackends:              ingressCfg.TCPEndpoints,
-		UDPBackends:              ingressCfg.UDPEndpoints,
+		// 配置请求时自定义的 header 填充, 模板中使用 proxy_set_header 指令
+		ProxySetHeaders: setHeaders,
+		// 定制响应报文的 header, 模板中使用 more_set_headers 指令
+		AddHeaders: addHeaders,
+		// 连接全队列的大小, 从 /net/core/somaxconn 获取, 读取失败或者过小则设置为 511.
+		BacklogSize:         sysctlSomaxconn(),
+		Backends:            ingressCfg.Backends,
+		PassthroughBackends: ingressCfg.PassthroughBackends,
+		// nginx 的 server 段配置
+		Servers: ingressCfg.Servers,
+		// nginx stream tcp server 的配置
+		TCPBackends: ingressCfg.TCPEndpoints,
+		// nginx stream udp server 的配置
+		UDPBackends: ingressCfg.UDPEndpoints,
+		// ngx_config 配置
 		Cfg:                      cfg,
 		IsIPV6Enabled:            n.isIPV6Enabled && !cfg.DisableIpv6,
 		NginxStatusIpv4Whitelist: cfg.NginxStatusIpv4Whitelist,
 		NginxStatusIpv6Whitelist: cfg.NginxStatusIpv6Whitelist,
-		RedirectServers:          utilingress.BuildRedirects(ingressCfg.Servers),
-		IsSSLPassthroughEnabled:  n.cfg.EnableSSLPassthrough,
-		ListenPorts:              n.cfg.ListenPorts,
-		EnableMetrics:            n.cfg.EnableMetrics,
-		MaxmindEditionFiles:      n.cfg.MaxmindEditionFiles,
-		HealthzURI:               nginx.HealthPath,
-		MonitorMaxBatchSize:      n.cfg.MonitorMaxBatchSize,
-		PID:                      nginx.PID,
-		StatusPath:               nginx.StatusPath,
-		StatusPort:               nginx.StatusPort,
-		StreamPort:               nginx.StreamPort,
-		StreamSnippets:           append(ingressCfg.StreamSnippets, cfg.StreamSnippet),
+		// redirect 跳转
+		RedirectServers:         utilingress.BuildRedirects(ingressCfg.Servers),
+		IsSSLPassthroughEnabled: n.cfg.EnableSSLPassthrough,
+		// 监听的端口
+		ListenPorts: n.cfg.ListenPorts,
+		// 开启 metrics 监控, 这个是在 http lua 逻辑里
+		EnableMetrics: n.cfg.EnableMetrics,
+		// 主要跟 geolite 有关系
+		MaxmindEditionFiles: n.cfg.MaxmindEditionFiles,
+		// 在每个 http server 里加入一个 location path 为 /healthz 的接口, 处理逻辑是直接 return  200
+		HealthzURI:          nginx.HealthPath,
+		MonitorMaxBatchSize: n.cfg.MonitorMaxBatchSize,
+		// 声明下 nginx pid 位置在 `/tmp/nginx/nginx.pid`
+		PID: nginx.PID,
+		// 开启 nginx status 接口
+		StatusPath:     nginx.StatusPath,
+		StatusPort:     nginx.StatusPort,
+		StreamPort:     nginx.StreamPort,
+		StreamSnippets: append(ingressCfg.StreamSnippets, cfg.StreamSnippet),
 	}
 
+	// 在 nginx.conf 文件头部位置的注释里加入配置的 checksum 校验码, 其实就是配置文件的 hash 值.
 	tc.Cfg.Checksum = ingressCfg.ConfigurationChecksum
 
+	// n.t 为 nginx.tmpl 的模板解释器, write 通过传递的 ngx 变量来生成 nginx 配置.
 	return n.t.Write(tc)
 }
 
 // testTemplate checks if the NGINX configuration inside the byte array is valid
 // running the command "nginx -t" using a temporal file.
+// 测试并校验 nginx 配置
 func (n NGINXController) testTemplate(cfg []byte) error {
 	if len(cfg) == 0 {
 		return fmt.Errorf("invalid NGINX configuration (empty)")
 	}
+	// 在 /tmp/nginx 临时目录创建前缀为 `nginx-cfg` 后跟随机数的临时文件.
 	tmpDir := os.TempDir() + "/nginx"
 	tmpfile, err := os.CreateTemp(tmpDir, tempNginxPattern)
 	if err != nil {
@@ -638,6 +691,7 @@ func (n NGINXController) testTemplate(cfg []byte) error {
 	if err != nil {
 		return err
 	}
+	// 通过 nginx -t -c nginx-cfgxxxx 来测试临时配置是否合法.
 	out, err := n.command.Test(tmpfile.Name())
 	if err != nil {
 		// this error is different from the rest because it must be clear why nginx is not working
@@ -659,20 +713,24 @@ Error: %v
 // changes were detected. The received backend Configuration is merged with the
 // configuration ConfigMap before generating the final configuration file.
 // Returns nil in case the backend was successfully reloaded.
+// 同步 nginx 配置
 func (n *NGINXController) OnUpdate(ingressCfg ingress.Configuration) error {
 	cfg := n.store.GetBackendConfiguration()
 	cfg.Resolver = n.resolver
 
+	// 通过模板生成 nginx 配置, 赋值给 content 对象里.
 	content, err := n.generateTemplate(cfg, ingressCfg)
 	if err != nil {
 		return err
 	}
 
+	// 根据不同的 collector 类型从 zipkin, jaeger 等选定模板, 然后创建 `opentracing` 配置, 把 opentracing 配置写到 /etc/nginx/opentracing.json 里.
 	err = createOpentracingCfg(cfg)
 	if err != nil {
 		return err
 	}
 
+	// 使用 `nginx -t -c tmpfile` 来检测临时生成的 nginx 配置文件.
 	err = createOpentelemetryCfg(cfg)
 	if err != nil {
 		return err
@@ -683,9 +741,12 @@ func (n *NGINXController) OnUpdate(ingressCfg ingress.Configuration) error {
 		return err
 	}
 
+	// 判断日志级别是否允许 2 level, 允许则打印新旧配置差异的部分.
 	if klog.V(2).Enabled() {
 		src, _ := os.ReadFile(cfgPath)
+		// 如果当前配置跟预期配置不同的话, 获取差异部分并打印输出.
 		if !bytes.Equal(src, content) {
+			// 把配置放到临时文件里
 			tmpfile, err := os.CreateTemp("", "new-nginx-cfg")
 			if err != nil {
 				return err
@@ -696,6 +757,7 @@ func (n *NGINXController) OnUpdate(ingressCfg ingress.Configuration) error {
 				return err
 			}
 
+			// 使用 diff 命令判断配置文件的差异
 			diffOutput, err := exec.Command("diff", "-I", "'# Configuration.*'", "-u", cfgPath, tmpfile.Name()).CombinedOutput()
 			if err != nil {
 				if exitError, ok := err.(*exec.ExitError); ok {
@@ -706,19 +768,23 @@ func (n *NGINXController) OnUpdate(ingressCfg ingress.Configuration) error {
 				}
 			}
 
+			// 打印配置中有差异的部分
 			klog.InfoS("NGINX configuration change", "diff", string(diffOutput))
 
 			// we do not defer the deletion of temp files in order
 			// to keep them around for inspection in case of error
+			// 删除临时文件
 			os.Remove(tmpfile.Name())
 		}
 	}
 
+	// 把 nginx 配置写到 /etc/nginx/nginx.conf 里.
 	err = os.WriteFile(cfgPath, content, file.ReadWriteByUser)
 	if err != nil {
 		return err
 	}
 
+	// 使用 nginx -s reload 进行热加载
 	o, err := n.command.ExecCommand("-s", "reload").CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("%v\n%v", err, string(o))
@@ -840,9 +906,12 @@ func clearL4serviceEndpoints(config *ingress.Configuration) {
 
 // configureDynamically encodes new Backends in JSON format and POSTs the
 // payload to an internal HTTP endpoint handled by Lua.
+// 变更信息通知给 nginx
 func (n *NGINXController) configureDynamically(pcfg *ingress.Configuration) error {
 	backendsChanged := !reflect.DeepEqual(n.runningConfig.Backends, pcfg.Backends)
+	// 当 endpoints 地址发生变更时
 	if backendsChanged {
+		// 动态修改 http 的 backends
 		err := configureBackends(pcfg.Backends)
 		if err != nil {
 			return err
@@ -850,7 +919,9 @@ func (n *NGINXController) configureDynamically(pcfg *ingress.Configuration) erro
 	}
 
 	streamConfigurationChanged := !reflect.DeepEqual(n.runningConfig.TCPEndpoints, pcfg.TCPEndpoints) || !reflect.DeepEqual(n.runningConfig.UDPEndpoints, pcfg.UDPEndpoints)
+	// 当 endpoints 地址发生变更时
 	if streamConfigurationChanged {
+		// 动态修改 tcp 和 udp 的 backends 地址列表
 		err := updateStreamConfiguration(pcfg.TCPEndpoints, pcfg.UDPEndpoints)
 		if err != nil {
 			return err
@@ -858,7 +929,9 @@ func (n *NGINXController) configureDynamically(pcfg *ingress.Configuration) erro
 	}
 
 	serversChanged := !reflect.DeepEqual(n.runningConfig.Servers, pcfg.Servers)
+	// 当 servers 地址发生变更时
 	if serversChanged {
+		// 动态修改证书相关配置
 		err := configureCertificates(pcfg.Servers)
 		if err != nil {
 			return err
@@ -975,6 +1048,7 @@ type sslConfiguration struct {
 
 // configureCertificates JSON encodes certificates and POSTs it to an internal HTTP endpoint
 // that is handled by Lua
+// 动态修改证书相关配置
 func configureCertificates(rawServers []*ingress.Server) error {
 	configuration := &sslConfiguration{
 		Certificates: map[string]string{},
